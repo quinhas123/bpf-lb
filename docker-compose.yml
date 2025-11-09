@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  server-1:
+    container_name: server-1
+    image: http-server
+    ports:
+      - "80:8000"
+  server-2:
+    container_name: server-2
+    image: http-server
+    ports:
+      - "81:8000"
+    command: ["uv", "run", "--script", "simple-http-server.py", "-i", "2"]
