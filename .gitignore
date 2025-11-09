@@ -1,2 +1,2 @@
-./simple-http-server/.env
-./simple-http-server/pyvenv.cfg
+simple-http-server/.env
+simple-http-server/pyvenv.cfg
