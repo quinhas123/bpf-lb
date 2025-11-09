@@ -12,6 +12,7 @@ Start server with uv using:
 '''
 
 import argparse
+import logging
 from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -38,15 +39,17 @@ def run(identifier, server_class=HTTPServer, handler_class=S, addr="localhost", 
     partially_initialized_handler_class = partial(handler_class, identifier)
     httpd = server_class(server_address, partially_initialized_handler_class)
 
-    print(f"Starting httpd server on {addr}:{port}")
+    logging.info(f"Starting httpd server on {addr}:{port}")
     httpd.serve_forever()
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
     parser = argparse.ArgumentParser(description="Simple HTTP server")
     parser.add_argument(
         "-l",
         "--listen",
-        default="localhost",
+        default="0.0.0.0",
         help="Specify the IP address on which the server listens",
     )
     parser.add_argument(
