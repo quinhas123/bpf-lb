@@ -12,15 +12,12 @@ GO_GEN_T := $(BPF_OBJ_EL) $(BPF_OBJ_EB) $(GO_GEN_EL) $(GO_GEN_EB)
 all: build
 
 generate: gen.go $(TARGET).c go.mod go.sum
-	@echo "Generating eBPF scaffolding..."
 	go generate
 
 $(GO_GEN_T): generate
 
 build: $(GO_GEN_T)
-	@echo "Building Go binary..."
 	go build -o $(TARGET)
 
 clean:
-	@echo "Cleaning..."
 	rm -f $(GO_GEN_T) $(TARGET)
