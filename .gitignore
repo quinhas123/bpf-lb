@@ -1,5 +1,6 @@
 lb/counter
-lb/counter_bpfeb.go
-lb/counter_bpfeb.o
-lb/counter_bpfel.go
-lb/counter_bpfel.o
+lb/*_bpfeb.go
+lb/*.o
+lb/*_bpfel.go
+
+.vscode/
