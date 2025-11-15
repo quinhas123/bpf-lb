@@ -11,12 +11,21 @@
 #define CLIENT 4
 #define LB 5
 
+#define CIRC_ARRAY_SIZE 2
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY); 
     __type(key, __u32);
-    __type(value, __u64);
+    __type(value, __u32);
+    __uint(max_entries, CIRC_ARRAY_SIZE);
+} backend_circ_array SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
-} pkt_count SEC(".maps"); 
+    __type(key, __u32);
+    __type(value, __u32);
+} index_map SEC(".maps");
 
 SEC("xdp") 
 int lb(struct xdp_md *ctx) {
@@ -40,10 +49,28 @@ int lb(struct xdp_md *ctx) {
         return XDP_PASS;
 
     if (iph->saddr == IP(CLIENT)) {
+        //round-robin per packet == broken for any multi-packet flow.
         bpf_printk("client packet - request");
 
-        iph->daddr = IP(BACKEND_A);
-        eth->h_dest[5] = BACKEND_A;
+        __u32 key    = 0; 
+        __u32 *idx = bpf_map_lookup_elem(&index_map, &key);
+
+        if (idx == NULL)
+            return XDP_PASS;
+
+        bpf_printk("map index %u", *idx);
+        __u32 *backend_n = bpf_map_lookup_elem(&backend_circ_array, idx);
+
+        if (backend_n == NULL) 
+            return XDP_PASS;
+        
+        bpf_printk("backend %u", *backend_n);
+
+        iph->daddr = IP(*backend_n);
+        eth->h_dest[5] = *backend_n;
+
+        __u32 pos = (*idx + 1) % CIRC_ARRAY_SIZE;
+        bpf_map_update_elem(&index_map, &key, &pos, BPF_ANY);
     } else {
         bpf_printk("server packet - response");
 
@@ -54,13 +81,8 @@ int lb(struct xdp_md *ctx) {
     eth->h_source[5] = LB;
 
     iph->check = iph_csum(iph);
-    //__u32 key    = 0; 
-    //__u64 *count = bpf_map_lookup_elem(&pkt_count, &key); 
-    //if (count) { 
-    //    __sync_fetch_and_add(count, 1); 
-    //}
 
     return XDP_TX; 
 }
 
-char __license[] SEC("license") = "Dual MIT/GPL";
+char __license[] SEC("license") = "Dual MIT/GPL";    

@@ -1,14 +1,36 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 )
+
+func initMaps(objs *lbObjects) error {
+	var idxKey uint32 = 0
+	var idxVal uint32 = 0
+	if err := objs.lbMaps.IndexMap.Update(&idxKey, &idxVal, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("init index_map: %w", err)
+	}
+
+	var firstBackendIp uint32 = 2
+	backendSize := uint32(objs.BackendCircArray.MaxEntries())
+	for i := uint32(0); i < backendSize; i++ {
+    	v := firstBackendIp
+		if err := objs.BackendCircArray.Update(&i, &v, ebpf.UpdateAny); err != nil {
+			return err
+		}
+		firstBackendIp++
+	}
+
+	return nil
+}
 
 // go generate && go build && sudo ./ebpf-test
 func main() {
@@ -24,7 +46,9 @@ func main() {
 	}
 	defer objs.Close()
 
-	ifname := "eth0" // Change this to an interface on your machine.
+	initMaps(&objs)
+
+	ifname := "eth0"
 	iface, err := net.InterfaceByName(ifname)
 	if err != nil {
 		log.Fatalf("Getting interface %s: %s", ifname, err)
@@ -34,8 +58,7 @@ func main() {
 	link, err := link.AttachXDP(link.XDPOptions{
 		Program:   objs.Lb,
 		Interface: iface.Index,
-		Flags:     link.XDPGenericMode, // matches bpftool
-
+		Flags:     link.XDPGenericMode,
 	})
 	if err != nil {
 		log.Fatal("Attaching XDP:", err)
