@@ -1,4 +1,4 @@
-lb/counter
+lb/lb
 lb/*_bpfeb.go
 lb/*.o
 lb/*_bpfel.go

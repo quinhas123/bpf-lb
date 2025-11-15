@@ -18,8 +18,8 @@ func main() {
 	}
 
 	// Load the compiled eBPF ELF and load it into the kernel.
-	var objs counterObjects
-	if err := loadCounterObjects(&objs, nil); err != nil {
+	var objs lbObjects
+	if err := loadLbObjects(&objs, nil); err != nil {
 		log.Fatal("Loading eBPF objects:", err)
 	}
 	defer objs.Close()
@@ -32,7 +32,7 @@ func main() {
 
 	// Attach count_packets to the network interface.
 	link, err := link.AttachXDP(link.XDPOptions{
-		Program:   objs.CountPackets,
+		Program:   objs.Lb,
 		Interface: iface.Index,
 		Flags:     link.XDPGenericMode, // matches bpftool
 

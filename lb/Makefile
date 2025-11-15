@@ -1,4 +1,4 @@
-TARGET := counter
+TARGET := lb
 
 BPF_OBJ_EL := $(TARGET)_bpfel.o
 BPF_OBJ_EB := $(TARGET)_bpfeb.o
@@ -11,7 +11,7 @@ GO_GEN_T := $(BPF_OBJ_EL) $(BPF_OBJ_EB) $(GO_GEN_EL) $(GO_GEN_EB)
 
 all: build
 
-generate: gen.go $(TARGET).c go.mod go.sum
+generate: gen.go $(TARGET).c $(TARGET).h go.mod go.sum
 	go generate
 
 $(GO_GEN_T): generate
