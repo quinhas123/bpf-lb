@@ -1,0 +1,13 @@
+# Test topology runs on the loopback interface, so backends live in 127.0.0.0/8.
+# Run a server on each (e.g. 127.0.0.2:80, 127.0.0.3:80). MAC addresses are
+# unused on loopback (frames carry all-zero MACs), so they're left zeroed.
+pools:
+  tcp:
+    servers:
+      - ip: 127.0.0.2
+        mac: 00:00:00:00:00:00
+      - ip: 127.0.0.3
+        mac: 00:00:00:00:00:00
+
+  udp:
+    servers: []

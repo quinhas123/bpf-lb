@@ -3,4 +3,10 @@ lb/*_bpfeb.go
 lb/*.o
 lb/*_bpfel.go
 
-.vscode/
+XDP/xdp
+XDP/bpf-lb
+XDP/*_bpfeb.go
+XDP/*.o
+XDP/*_bpfel.go
+
+.vscode/inspect_http_host
