@@ -36,10 +36,7 @@ struct flow_key {
     __u8   proto;
 };
 
-// Build a conntrack key. A hash-map key is matched over its full byte width
-// (padding included), so the whole struct is zeroed first; otherwise an
-// uninitialized pad byte could make two otherwise-equal keys miss each other.
-// `sport` is given in host order and stored network order, matching the map.
+// initialize whole struct with 0 so trash bytes dont occupy the padding byte and potentially ruin hashmap lookups
 static __always_inline struct flow_key flow_key_of(__be32 saddr, __u16 sport, __u8 proto) {
     struct flow_key fk;
     __builtin_memset(&fk, 0, sizeof(fk));
@@ -50,8 +47,8 @@ static __always_inline struct flow_key flow_key_of(__be32 saddr, __u16 sport, __
 }
 
 struct ct_entry {
-    struct backend backend;        // forward path
-    __u8           return_mac[6];  // reverse path
+    struct backend backend;                      // forward path
+    struct backend original_destination_server;  // reverse path
 };
 
 // TODO: delete the entry on FIN/RST instead of relying on LRU eviction.
@@ -115,8 +112,7 @@ static __always_inline enum l7_proto l7_from_ports(__u8 l4, __u16 sport, __u16 d
     return L7_UNKNOWN;
 }
 
-// TODO: is there no bpf helper for checksum recalculation
-// Fold a 32/64-bit accumulated checksum down to the final 16-bit value.
+// basically linux kernel csum_fold
 static __always_inline __u16 csum_fold(__u64 csum) {
     csum = (csum & 0xffffffff) + (csum >> 32);
     csum = (csum & 0xffff) + (csum >> 16);
@@ -124,14 +120,11 @@ static __always_inline __u16 csum_fold(__u64 csum) {
     return (__u16)~csum;
 }
 
-// Incrementally patch a 16-bit internet checksum after a 32-bit word
-// (here: the IPv4 destination address) changed from `old` to `new`.
 static __always_inline __u16 csum_replace32(__u16 old_check, __be32 old, __be32 new) {
     __u64 sum = bpf_csum_diff(&old, sizeof(old), &new, sizeof(new),
                               (__u32)(~old_check & 0xffff));
     return csum_fold(sum);
 }
-
 
 static __always_inline int rewrite_to_backend(struct ethhdr *eth, struct iphdr *iph,
                                                void *l4hdr, void *data_end,
@@ -144,9 +137,7 @@ static __always_inline int rewrite_to_backend(struct ethhdr *eth, struct iphdr *
     __be32 old_daddr = iph->daddr;
     iph->daddr = b->ip;
     iph->check = csum_replace32(iph->check, old_daddr, iph->daddr);
-
-    // L4: the dst IP is part of the TCP/UDP pseudo-header, so their checksums
-    // need the same incremental fix or the packet is dropped at L4 validation.
+    
     if (iph->protocol == IPPROTO_TCP) {
         struct tcphdr *th = l4hdr;
         if ((void *)(th + 1) > data_end)
@@ -156,7 +147,7 @@ static __always_inline int rewrite_to_backend(struct ethhdr *eth, struct iphdr *
         struct udphdr *uh = l4hdr;
         if ((void *)(uh + 1) > data_end)
             return XDP_PASS;
-        // A zero UDP checksum means "no checksum" in IPv4; leave it alone.
+        // zero UDP checksum means "no checksum" in IPv4; leave it alone.
         if (uh->check) {
             __u16 c = csum_replace32(uh->check, old_daddr, iph->daddr);
             uh->check = c ? c : 0xffff;  // 0 is reserved, use the equivalent 0xffff
@@ -169,14 +160,14 @@ static __always_inline int rewrite_to_backend(struct ethhdr *eth, struct iphdr *
 // constant VIP
 static __always_inline int rewrite_to_client(struct ethhdr *eth, struct iphdr *iph,
                                               void *l4hdr, void *data_end,
-                                              __u8 *return_mac) {
+                                              struct backend *original_destination_server) {
     // rearrange MAC addresses
     __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
-    __builtin_memcpy(eth->h_dest, return_mac, ETH_ALEN);
+    __builtin_memcpy(eth->h_dest, original_destination_server->mac, ETH_ALEN);
 
     // src IP is LB IP
     __be32 old_saddr = iph->saddr;
-    iph->saddr = VIP;
+    iph->saddr = original_destination_server->ip;
     iph->check = csum_replace32(iph->check, old_saddr, iph->saddr);
 
     // L4: the src IP is part of the TCP/UDP pseudo-header, so patch those too.
@@ -218,11 +209,10 @@ static __always_inline int round_robin(struct ethhdr *eth, struct iphdr *iph,
     struct backend *b = bpf_map_lookup_elem(&backends, &slot);
     if (!b)
         return XDP_PASS;
-
     
     struct ct_entry e = { .backend = *b };
-    // TODO: why use __builtin_memcpy
-    __builtin_memcpy(e.return_mac, eth->h_source, ETH_ALEN);
+    __builtin_memcpy(e.original_destination_server.mac, eth->h_source, ETH_ALEN);
+    e.original_destination_server.ip = iph->daddr;
     // TODO: do not ignore return
     bpf_map_update_elem(&conntrack, fk, &e, BPF_ANY);
 
@@ -310,9 +300,9 @@ int xdp_ingress(struct xdp_md *ctx) {
 
         struct ct_entry *e = bpf_map_lookup_elem(&conntrack, &client_fk);
         if (e == NULL)
-            return XDP_PASS;               // untracked flow: leave it to the stack
+            return XDP_PASS;
 
-        return rewrite_to_client(eth, iph, l4hdr, data_end, e->return_mac);
+        return rewrite_to_client(eth, iph, l4hdr, data_end, &e->original_destination_server);
     }
 
     // only ipv4 tcp/udp is balanced for now
@@ -321,8 +311,6 @@ int xdp_ingress(struct xdp_md *ctx) {
 
         struct ct_entry *e = bpf_map_lookup_elem(&conntrack, &client_fk);
         if (e == NULL) {
-            // No sticky entry yet: pick one round-robin, which records it
-            // under client_fk for subsequent packets of this flow.
             return round_robin(eth, iph, l4hdr, data_end, &client_fk);
         }
 
