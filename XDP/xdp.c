@@ -190,6 +190,44 @@ static __always_inline int rewrite_to_client(struct ethhdr *eth, struct iphdr *i
     return XDP_TX;
 }
 
+// FNV-1a simple hashing for consistent hashing (no remapping supported)
+static __always_inline __u32 flow_hash(const struct flow_key *fk) {
+    __u32 offset = 2166136261u;
+    __u32 prime  = 16777619u;
+    offset = (offset ^ (fk->saddr         & 0xff)) * prime;
+    offset = (offset ^ ((fk->saddr >> 8)  & 0xff)) * prime;
+    offset = (offset ^ ((fk->saddr >> 16) & 0xff)) * prime;
+    offset = (offset ^ ((fk->saddr >> 24) & 0xff)) * prime;
+    offset = (offset ^ (fk->sport         & 0xff)) * prime;
+    offset = (offset ^ ((fk->sport >> 8)  & 0xff)) * prime;
+    offset = (offset ^ fk->proto)                  * prime;
+    return offset;
+}
+
+static __always_inline int hash_balance(struct ethhdr *eth, struct iphdr *iph,
+                                         void *l4hdr, void *data_end,
+                                         struct flow_key *fk) {
+    __u32 zero = 0;
+
+    __u32 *count = bpf_map_lookup_elem(&backend_count, &zero);
+    if (!count || *count == 0)
+        return XDP_PASS;
+
+    __u32 slot = flow_hash(fk) % *count;
+
+    struct backend *b = bpf_map_lookup_elem(&backends, &slot);
+    if (!b)
+        return XDP_PASS;
+
+    struct ct_entry e = { .backend = *b };
+    __builtin_memcpy(e.original_destination_server.mac, eth->h_source, ETH_ALEN);
+    e.original_destination_server.ip = iph->daddr;
+    // TODO: do not ignore return
+    bpf_map_update_elem(&conntrack, fk, &e, BPF_ANY);
+
+    return rewrite_to_backend(eth, iph, l4hdr, data_end, b);
+}
+
 static __always_inline int round_robin(struct ethhdr *eth, struct iphdr *iph,
                                         void *l4hdr, void *data_end,
                                         struct flow_key *fk) {
@@ -217,6 +255,17 @@ static __always_inline int round_robin(struct ethhdr *eth, struct iphdr *iph,
     bpf_map_update_elem(&conntrack, fk, &e, BPF_ANY);
 
     return rewrite_to_backend(eth, iph, l4hdr, data_end, b);
+}
+
+static __always_inline int balance(struct ethhdr *eth, struct iphdr *iph,
+                                    void *l4hdr, void *data_end,
+                                    struct flow_key *fk, enum l7_proto l7) {
+    switch (l7) {
+    case L7_HTTPS:
+        return hash_balance(eth, iph, l4hdr, data_end, fk);
+    default:
+        return round_robin(eth, iph, l4hdr, data_end, fk);
+    }
 }
 
 SEC("xdp")
@@ -311,7 +360,7 @@ int xdp_ingress(struct xdp_md *ctx) {
 
         struct ct_entry *e = bpf_map_lookup_elem(&conntrack, &client_fk);
         if (e == NULL) {
-            return round_robin(eth, iph, l4hdr, data_end, &client_fk);
+            return balance(eth, iph, l4hdr, data_end, &client_fk, l7);
         }
 
         return rewrite_to_backend(eth, iph, l4hdr, data_end, &e->backend);
