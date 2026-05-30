@@ -35,11 +35,6 @@ func loadConfig(path string) (*config, error) {
 	return &cfg, nil
 }
 
-// populateBackends writes the given servers into the eBPF backend pool and
-// records how many slots are live, so the datapath can round-robin over them.
-//
-// NOTE: the datapath currently uses a single shared pool, so this loads one
-// protocol's servers (see main). Per-protocol pools are not wired in yet.
 func populateBackends(objs *xdpObjects, servers []server) error {
 	if len(servers) == 0 {
 		return fmt.Errorf("no backends configured")
