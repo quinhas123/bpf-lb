@@ -24,6 +24,7 @@ const (
 var (
 	vip      = net.IPv4(127, 0, 0, 1).To4()
 	backend0 = net.IPv4(127, 0, 0, 2).To4() // first slot -> first round-robin pick
+	backend1 = net.IPv4(127, 0, 0, 3).To4() // second slot
 	clientIP = net.IPv4(127, 0, 0, 50).To4()
 
 	clientMAC = net.HardwareAddr{0x02, 0, 0, 0, 0, 0x50}
@@ -34,6 +35,7 @@ var (
 const (
 	clientPort  = 12345
 	servicePort = 80
+	httpsPort   = 443
 )
 
 // Offsets within the crafted Ethernet+IPv4+TCP packet.
@@ -115,6 +117,88 @@ func TestXDPLoadBalance(t *testing.T) {
 	}
 	if !bytes.Equal(out[0:6], clientMAC) {
 		t.Errorf("reverse: dst MAC = %x, want stored client MAC %x", out[0:6], clientMAC)
+	}
+}
+
+// flowHashRef mirrors flow_hash() in xdp.c: FNV-1a over the flow_key bytes as
+// laid out on the little-endian / bpfel target. saddr contributes its four IP
+// octets in order; sport contributes its two network-order bytes (high, low);
+// proto is the IP protocol number. Kept as an independent reimplementation so
+// the test fails if the C hash drifts from spec.
+func flowHashRef(srcIP net.IP, sport uint16, proto uint8) uint32 {
+	const (
+		basis = uint32(2166136261) // FNV offset basis
+		prime = uint32(16777619)   // FNV prime
+	)
+	ip := srcIP.To4()
+	h := basis
+	h = (h ^ uint32(ip[0])) * prime
+	h = (h ^ uint32(ip[1])) * prime
+	h = (h ^ uint32(ip[2])) * prime
+	h = (h ^ uint32(ip[3])) * prime
+	h = (h ^ uint32(sport>>8)) * prime
+	h = (h ^ uint32(sport&0xff)) * prime
+	h = (h ^ uint32(proto)) * prime
+	return h
+}
+
+// TestXDPHashBalanceHTTPS drives HTTPS flows (port 443) through the program,
+// which the dispatcher routes to hash_balance, and asserts each flow is sent to
+// the backend predicted by flowHashRef. Sweeping source ports also confirms the
+// hash spreads flows across both backends.
+func TestXDPHashBalanceHTTPS(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("BPF_PROG_TEST_RUN requires root / CAP_BPF; run with sudo")
+	}
+
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("remove memlock: %v", err)
+	}
+
+	var objs xdpObjects
+	if err := loadXdpObjects(&objs, nil); err != nil {
+		t.Fatalf("load eBPF objects: %v", err)
+	}
+	defer objs.Close()
+
+	servers := []server{
+		{IP: "127.0.0.2", MAC: "00:00:00:00:00:00"},
+		{IP: "127.0.0.3", MAC: "00:00:00:00:00:00"},
+	}
+	if err := populateBackends(&objs, servers); err != nil {
+		t.Fatalf("populate backends: %v", err)
+	}
+	backendBySlot := []net.IP{backend0, backend1}
+	count := uint32(len(servers))
+
+	const protoTCP = 6
+	seen := map[string]bool{}
+	for sport := uint16(2000); sport < 2100; sport++ {
+		want := backendBySlot[flowHashRef(clientIP, sport, protoTCP)%count]
+
+		pkt := buildTCPPacket(clientMAC, lbMAC, clientIP, vip, sport, httpsPort)
+		verdict, out, err := objs.XdpIngress.Test(pkt)
+		if err != nil {
+			t.Fatalf("sport %d: run: %v", sport, err)
+		}
+		if verdict != xdpTx {
+			t.Fatalf("sport %d: verdict = %d, want XDP_TX (%d)", sport, verdict, xdpTx)
+		}
+		out = out[:len(pkt)]
+
+		ip := out[ethLen : ethLen+ipLen]
+		gotDst := net.IP(ip[16:20])
+		if !gotDst.Equal(want) {
+			t.Errorf("sport %d: dst IP = %v, want hash-picked backend %v", sport, gotDst, want)
+		}
+		if !ipChecksumValid(ip) {
+			t.Errorf("sport %d: IPv4 checksum invalid after DNAT", sport)
+		}
+		seen[gotDst.String()] = true
+	}
+
+	if len(seen) < 2 {
+		t.Errorf("hash sent all flows to %v; expected a spread across both backends", seen)
 	}
 }
 
