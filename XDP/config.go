@@ -37,9 +37,6 @@ var l7Index = map[string]xdpL7Proto{
 	"https": xdpL7ProtoL7HTTPS,
 	"dns":   xdpL7ProtoL7DNS,
 	"ssh":   xdpL7ProtoL7SSH,
-	"quic":  xdpL7ProtoL7QUIC,
-	"smtp":  xdpL7ProtoL7SMTP,
-	"ftp":   xdpL7ProtoL7FTP,
 }
 
 func loadConfig(path string) (*config, error) {
@@ -65,7 +62,7 @@ func populatePools(spec *ebpf.CollectionSpec, objs *xdpObjects, cfg *config) ([]
 	for name, p := range cfg.Pools {
 		l7, ok := l7Index[name]
 		if !ok {
-			return inners, fmt.Errorf("unknown L7 pool %q (want http/https/dns/ssh/quic/smtp/ftp)", name)
+			return inners, fmt.Errorf("unknown L7 pool %q (want http/https/dns/ssh)", name)
 		}
 		if len(p.Servers) == 0 {
 			continue

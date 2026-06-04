@@ -39,9 +39,6 @@ enum l7_proto {
     L7_HTTPS,
     L7_DNS,
     L7_SSH,
-    L7_QUIC,
-    L7_SMTP,
-    L7_FTP,
     L7_MAX,  // keep last: number of L7 protocols, sizes the per-protocol maps
 };
 
