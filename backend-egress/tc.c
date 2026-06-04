@@ -85,7 +85,6 @@ int tc_egress(struct __sk_buff *skb) {
         bpf_l4_csum_replace(skb, l4sum_off, old_saddr, new_saddr,
                             BPF_F_PSEUDO_HDR | sizeof(new_saddr));
     } else if (udp_check != 0) {
-        // A zero UDP checksum means "no checksum" in IPv4; leave it alone.
         // BPF_F_MARK_MANGLED_0 keeps a computed-to-zero result as 0xffff.
         int l4sum_off = l3_off + ihl + __builtin_offsetof(struct udphdr, check);
         bpf_l4_csum_replace(skb, l4sum_off, old_saddr, new_saddr,
