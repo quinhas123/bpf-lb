@@ -1,8 +1,3 @@
-lb/lb
-lb/*_bpfeb.go
-lb/*.o
-lb/*_bpfel.go
-
 backend-egress/tc
 backend-egress/*_bpfeb.go
 backend-egress/*.o
