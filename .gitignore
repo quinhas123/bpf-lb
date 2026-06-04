@@ -3,6 +3,11 @@ lb/*_bpfeb.go
 lb/*.o
 lb/*_bpfel.go
 
+backend-egress/tc
+backend-egress/*_bpfeb.go
+backend-egress/*.o
+backend-egress/*_bpfel.go
+
 XDP/xdp
 XDP/bpf-lb
 XDP/*_bpfeb.go
