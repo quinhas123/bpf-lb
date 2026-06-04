@@ -102,12 +102,9 @@ static __always_inline enum l7_proto l7_from_ports(__u8 l4, __u16 sport, __u16 d
         if (p1 == 8080 || p2 == 8080) return L7_HTTP;
         if (p1 == 443  || p2 == 443)  return L7_HTTPS;
         if (p1 == 22   || p2 == 22)   return L7_SSH;
-        if (p1 == 25   || p2 == 25)   return L7_SMTP;
-        if (p1 == 21   || p2 == 21)   return L7_FTP;
         if (p1 == 53   || p2 == 53)   return L7_DNS;
     } else if (l4 == IPPROTO_UDP) {
         if (p1 == 53  || p2 == 53)  return L7_DNS;
-        if (p1 == 443 || p2 == 443) return L7_QUIC;
     }
     return L7_UNKNOWN;
 }
@@ -157,7 +154,6 @@ static __always_inline int rewrite_to_backend(struct ethhdr *eth, struct iphdr *
     return XDP_TX;
 }
 
-// constant VIP
 static __always_inline int rewrite_to_client(struct ethhdr *eth, struct iphdr *iph,
                                               void *l4hdr, void *data_end,
                                               struct backend *original_destination_server) {
@@ -303,15 +299,7 @@ int xdp_ingress(struct xdp_md *ctx) {
         }
 
         l4proto = iph->protocol;
-    } else if (bpf_ntohs(eth->h_proto) == ETH_P_IPV6) {
-        // todo: remove ipv6 support
-        struct ipv6hdr *ip6 = (void *)(eth + 1);
-        if ((void *)(ip6 + 1) > data_end)
-            return XDP_PASS;
-
-        l4hdr = (void *)(ip6 + 1);
-        l4proto = ip6->nexthdr;
-    } else {
+    }  else {
         return XDP_PASS;
     }
 
@@ -334,14 +322,10 @@ int xdp_ingress(struct xdp_md *ctx) {
         sport = bpf_ntohs(uh->source);
         dport = bpf_ntohs(uh->dest);
     } else {
-        bpf_printk("xdp ingress: l4=%u (no ports)", l4proto);
         return XDP_PASS;
     }
 
     enum l7_proto l7 = l7_from_ports(l4proto, sport, dport);
-
-    bpf_printk("xdp ingress: l4=%u sport=%u dport=%u l7=%u",
-               l4proto, sport, dport, l7);
 
     // TODO: move logic to TC_egress hook
     if (iph != NULL && (iph->saddr == IP(BACKEND_A) || iph->saddr == IP(BACKEND_B))) {
@@ -354,8 +338,8 @@ int xdp_ingress(struct xdp_md *ctx) {
         return rewrite_to_client(eth, iph, l4hdr, data_end, &e->original_destination_server);
     }
 
-    // only ipv4 tcp/udp is balanced for now
-    if (iph) {
+    // only ipv4 tcp/udp is balanced
+    if (l7 != L7_UNKNOWN) {
         struct flow_key client_fk = flow_key_of(iph->saddr, sport, l4proto);
 
         struct ct_entry *e = bpf_map_lookup_elem(&conntrack, &client_fk);
