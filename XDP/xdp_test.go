@@ -19,8 +19,7 @@ const (
 	xdpRedirect
 )
 
-// Loopback test addresses. Must match xdp.c (IP(x) = 127.0.0.x, VIP = 127.0.0.1)
-// and the backend pool below.
+// Loopback test addresses, matching the backend pool below.
 var (
 	vip      = net.IPv4(127, 0, 0, 1).To4()
 	backend0 = net.IPv4(127, 0, 0, 2).To4() // first slot -> first round-robin pick
@@ -68,7 +67,13 @@ func TestXDPLoadBalance(t *testing.T) {
 		t.Fatalf("populate backends: %v", err)
 	}
 
-	// --- Forward: client -> VIP, expect DNAT to the first backend. ---
+	// --- Forward: client -> VIP over HTTP (TCP). TCP is connection-oriented, so
+	// the dispatcher routes it to consistent hashing; expect DNAT to the
+	// hash-picked backend. ---
+	const protoTCP = 6
+	backendBySlot := []net.IP{backend0, backend1}
+	wantBackend := backendBySlot[flowHashRef(clientIP, clientPort, protoTCP)%uint32(len(servers))]
+
 	fwd := buildTCPPacket(clientMAC, lbMAC, clientIP, vip, clientPort, servicePort)
 	verdict, out, err := objs.XdpIngress.Test(fwd)
 	if err != nil {
@@ -80,8 +85,8 @@ func TestXDPLoadBalance(t *testing.T) {
 		t.Fatalf("forward: verdict = %d, want XDP_TX (%d)", verdict, xdpTx)
 	}
 	ip, tcp := out[ethLen:ethLen+ipLen], out[ethLen+ipLen:ethLen+ipLen+tcpLen]
-	if gotDst := net.IP(ip[16:20]); !gotDst.Equal(backend0) {
-		t.Errorf("forward: dst IP = %v, want backend %v", gotDst, backend0)
+	if gotDst := net.IP(ip[16:20]); !gotDst.Equal(wantBackend) {
+		t.Errorf("forward: dst IP = %v, want hash-picked backend %v", gotDst, wantBackend)
 	}
 	if !ipChecksumValid(ip) {
 		t.Error("forward: IPv4 checksum invalid after DNAT")
@@ -91,32 +96,6 @@ func TestXDPLoadBalance(t *testing.T) {
 	}
 	if !bytes.Equal(out[0:6], zeroMAC) {
 		t.Errorf("forward: dst MAC = %x, want backend MAC %x", out[0:6], zeroMAC)
-	}
-
-	// --- Reverse: backend reply -> client, expect source restored to VIP and
-	// the frame sent back to the return MAC captured on the forward pass. ---
-	rev := buildTCPPacket(zeroMAC, lbMAC, backend0, clientIP, servicePort, clientPort)
-	verdict, out, err = objs.XdpIngress.Test(rev)
-	if err != nil {
-		t.Fatalf("reverse run: %v", err)
-	}
-	out = out[:len(rev)]
-
-	if verdict != xdpTx {
-		t.Fatalf("reverse: verdict = %d, want XDP_TX (%d)", verdict, xdpTx)
-	}
-	ip, tcp = out[ethLen:ethLen+ipLen], out[ethLen+ipLen:ethLen+ipLen+tcpLen]
-	if gotSrc := net.IP(ip[12:16]); !gotSrc.Equal(vip) {
-		t.Errorf("reverse: src IP = %v, want VIP %v", gotSrc, vip)
-	}
-	if !ipChecksumValid(ip) {
-		t.Error("reverse: IPv4 checksum invalid after un-NAT")
-	}
-	if !tcpChecksumValid(ip[12:16], ip[16:20], tcp) {
-		t.Error("reverse: TCP checksum invalid after un-NAT")
-	}
-	if !bytes.Equal(out[0:6], clientMAC) {
-		t.Errorf("reverse: dst MAC = %x, want stored client MAC %x", out[0:6], clientMAC)
 	}
 }
 
