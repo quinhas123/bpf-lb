@@ -1,4 +1,4 @@
-# pool names must match enum l7_proto in xdp.c (http, https, dns, ssh, quic, smtp, ftp)
+# pool names must match enum l7_proto in xdp.c (http, https, dns, ssh)
 pools:
   http:
     servers:
