@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 
+	"github.com/cilium/ebpf"
 	"gopkg.in/yaml.v3"
 )
 
@@ -22,6 +23,25 @@ type config struct {
 	Pools map[string]pool `yaml:"pools"`
 }
 
+// backendEntry mirrors `struct backend` in xdp.c: a 4-byte IPv4 address and a
+// 6-byte MAC, padded to 12 bytes. Defined here because the inner pool map
+// declares its value by size, so bpf2go emits no Go type for it.
+type backendEntry struct {
+	IP  uint32
+	MAC [6]byte
+	_   [2]byte
+}
+
+var l7Index = map[string]xdpL7Proto{
+	"http":  xdpL7ProtoL7HTTP,
+	"https": xdpL7ProtoL7HTTPS,
+	"dns":   xdpL7ProtoL7DNS,
+	"ssh":   xdpL7ProtoL7SSH,
+	"quic":  xdpL7ProtoL7QUIC,
+	"smtp":  xdpL7ProtoL7SMTP,
+	"ftp":   xdpL7ProtoL7FTP,
+}
+
 func loadConfig(path string) (*config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -35,41 +55,67 @@ func loadConfig(path string) (*config, error) {
 	return &cfg, nil
 }
 
-func populateBackends(objs *xdpObjects, servers []server) error {
-	if len(servers) == 0 {
-		return fmt.Errorf("no backends configured")
+func populatePools(spec *ebpf.CollectionSpec, objs *xdpObjects, cfg *config) ([]*ebpf.Map, error) {
+	poolsSpec, ok := spec.Maps["backend_pools"]
+	if !ok || poolsSpec.InnerMap == nil {
+		return nil, fmt.Errorf("backend_pools inner map template not found in spec")
 	}
 
-	for i, s := range servers {
-		ip := net.ParseIP(s.IP)
-		if ip == nil || ip.To4() == nil {
-			return fmt.Errorf("backend %d: invalid IPv4 address %q", i, s.IP)
+	var inners []*ebpf.Map
+	for name, p := range cfg.Pools {
+		l7, ok := l7Index[name]
+		if !ok {
+			return inners, fmt.Errorf("unknown L7 pool %q (want http/https/dns/ssh/quic/smtp/ftp)", name)
 		}
-		mac, err := net.ParseMAC(s.MAC)
+		if len(p.Servers) == 0 {
+			continue
+		}
+
+		inner, err := ebpf.NewMap(poolsSpec.InnerMap)
 		if err != nil {
-			return fmt.Errorf("backend %d: invalid MAC %q: %w", i, s.MAC, err)
+			return inners, fmt.Errorf("pool %q: creating inner map: %w", name, err)
 		}
-		if len(mac) != 6 {
-			return fmt.Errorf("backend %d: MAC %q is not 6 bytes", i, s.MAC)
+		inners = append(inners, inner)
+
+		for i, s := range p.Servers {
+			b, err := backendValue(s, i)
+			if err != nil {
+				return inners, fmt.Errorf("pool %q: %w", name, err)
+			}
+			if err := inner.Put(uint32(i), &b); err != nil {
+				return inners, fmt.Errorf("pool %q: writing backend %d: %w", name, i, err)
+			}
 		}
 
-		b := xdpBackend{
-			// The eBPF side stores the IP as __be32 (network byte order) and
-			// assigns it straight to iph->daddr. The ebpf library marshals
-			// struct fields in host byte order, so encode the network-order
-			// bytes as a host-order uint32 to land them in memory unchanged.
-			Ip: binary.LittleEndian.Uint32(ip.To4()),
+		if err := objs.BackendPools.Put(l7, inner); err != nil {
+			return inners, fmt.Errorf("pool %q: inserting into backend_pools: %w", name, err)
 		}
-		copy(b.Mac[:], mac)
-
-		if err := objs.Backends.Put(uint32(i), &b); err != nil {
-			return fmt.Errorf("backend %d: writing map: %w", i, err)
+		count := uint32(len(p.Servers))
+		if err := objs.BackendCount.Put(l7, &count); err != nil {
+			return inners, fmt.Errorf("pool %q: writing backend count: %w", name, err)
 		}
 	}
+	return inners, nil
+}
 
-	count := uint32(len(servers))
-	if err := objs.BackendCount.Put(uint32(0), &count); err != nil {
-		return fmt.Errorf("writing backend count: %w", err)
+// backendValue converts a config server entry into the eBPF backend struct.
+func backendValue(s server, idx int) (backendEntry, error) {
+	ip := net.ParseIP(s.IP)
+	if ip == nil || ip.To4() == nil {
+		return backendEntry{}, fmt.Errorf("backend %d: invalid IPv4 address %q", idx, s.IP)
 	}
-	return nil
+	mac, err := net.ParseMAC(s.MAC)
+	if err != nil {
+		return backendEntry{}, fmt.Errorf("backend %d: invalid MAC %q: %w", idx, s.MAC, err)
+	}
+	if len(mac) != 6 {
+		return backendEntry{}, fmt.Errorf("backend %d: MAC %q is not 6 bytes", idx, s.MAC)
+	}
+
+	// eBPF side stores the IP as __be32 (network byte order)
+	b := backendEntry{
+		IP: binary.LittleEndian.Uint32(ip.To4()),
+	}
+	copy(b.MAC[:], mac)
+	return b, nil
 }

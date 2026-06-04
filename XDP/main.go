@@ -14,37 +14,41 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config/backend-server-pools.yaml", "path to the backend pool config")
-	pool := flag.String("pool", "tcp", "which configured pool to load into the datapath")
+	ifname := flag.String("iface", "lo", "interface to attach the XDP program to")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatal("Loading config:", err)
 	}
-	p, ok := cfg.Pools[*pool]
-	if !ok {
-		log.Fatalf("Pool %q not found in %s", *pool, *configPath)
-	}
 
 	if err := rlimit.RemoveMemlock(); err != nil {
 		log.Fatal("Removing memlock:", err)
 	}
 
+	spec, err := loadXdp()
+	if err != nil {
+		log.Fatal("Loading eBPF spec:", err)
+	}
+
 	var objs xdpObjects
-	if err := loadXdpObjects(&objs, nil); err != nil {
+	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		log.Fatal("Loading eBPF objects:", err)
 	}
 	defer objs.Close()
 
-	if err := populateBackends(&objs, p.Servers); err != nil {
-		log.Fatal("Populating backends:", err)
+	inners, err := populatePools(spec, &objs, cfg)
+	for _, m := range inners {
+		defer m.Close()
 	}
-	log.Printf("Loaded %d backend(s) from pool %q", len(p.Servers), *pool)
-
-	ifname := "lo"
-	iface, err := net.InterfaceByName(ifname)
 	if err != nil {
-		log.Fatalf("Getting interface %s: %s", ifname, err)
+		log.Fatal("Populating pools:", err)
+	}
+	log.Printf("Loaded %d L7 pool(s)", len(inners))
+
+	iface, err := net.InterfaceByName(*ifname)
+	if err != nil {
+		log.Fatalf("Getting interface %s: %s", *ifname, err)
 	}
 
 	link, err := link.AttachXDP(link.XDPOptions{
@@ -58,7 +62,7 @@ func main() {
 	}
 	defer link.Close()
 
-	log.Printf("XDP ingress program attached to %s. Ctrl-C to exit.", ifname)
+	log.Printf("XDP ingress program attached to %s. Ctrl-C to exit.", *ifname)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

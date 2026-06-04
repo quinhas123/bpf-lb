@@ -33,28 +33,6 @@ static __always_inline struct flow_key flow_key_of(__be32 saddr, __u16 sport, __
     return fk;
 }
 
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, __u32);
-    __type(value, struct backend);
-    __uint(max_entries, MAX_BACKENDS);
-} backends SEC(".maps");
-
-// TODO: consequences of PERCPU, even though its safer
-struct {
-    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __type(key, __u32);
-    __type(value, __u32);
-    __uint(max_entries, 1);
-} rr_counter SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __type(key, __u32);
-    __type(value, __u32);
-    __uint(max_entries, 1);
-} backend_count SEC(".maps");
-
 enum l7_proto {
     L7_UNKNOWN = 0,
     L7_HTTP,
@@ -64,7 +42,37 @@ enum l7_proto {
     L7_QUIC,
     L7_SMTP,
     L7_FTP,
+    L7_MAX,  // keep last: number of L7 protocols, sizes the per-protocol maps
 };
+
+struct inner_backends {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, MAX_BACKENDS);
+    __uint(key_size, sizeof(__u32));
+    __uint(value_size, sizeof(struct backend));
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY_OF_MAPS);
+    __uint(max_entries, L7_MAX);
+    __type(key, enum l7_proto);
+    __array(values, struct inner_backends);
+} backend_pools SEC(".maps");
+
+
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, enum l7_proto);
+    __type(value, __u32);
+    __uint(max_entries, L7_MAX);
+} rr_counter SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, enum l7_proto);
+    __type(value, __u32);
+    __uint(max_entries, L7_MAX);
+} backend_count SEC(".maps");
 
 static __always_inline enum l7_proto l7_from_ports(__u8 l4, __u16 sport, __u16 dport) {
     // sort the two ports for symmetrical protocol identification in request and response
@@ -144,16 +152,18 @@ static __always_inline __u32 flow_hash(const struct flow_key *fk) {
 
 static __always_inline int hash_balance(struct ethhdr *eth, struct iphdr *iph,
                                          void *l4hdr, void *data_end,
-                                         struct flow_key *fk) {
-    __u32 zero = 0;
-
-    __u32 *count = bpf_map_lookup_elem(&backend_count, &zero);
+                                         struct flow_key *fk, enum l7_proto l7) {
+    __u32 *count = bpf_map_lookup_elem(&backend_count, &l7);
     if (!count || *count == 0)
+        return XDP_PASS;
+
+    void *pool = bpf_map_lookup_elem(&backend_pools, &l7);
+    if (!pool)
         return XDP_PASS;
 
     __u32 slot = flow_hash(fk) % *count;
 
-    struct backend *b = bpf_map_lookup_elem(&backends, &slot);
+    struct backend *b = bpf_map_lookup_elem(pool, &slot);
     if (!b)
         return XDP_PASS;
 
@@ -161,21 +171,23 @@ static __always_inline int hash_balance(struct ethhdr *eth, struct iphdr *iph,
 }
 
 static __always_inline int round_robin(struct ethhdr *eth, struct iphdr *iph,
-                                        void *l4hdr, void *data_end) {
-    __u32 zero = 0;
-
-    __u32 *count = bpf_map_lookup_elem(&backend_count, &zero);
+                                        void *l4hdr, void *data_end, enum l7_proto l7) {
+    __u32 *count = bpf_map_lookup_elem(&backend_count, &l7);
     if (!count || *count == 0)
         return XDP_PASS;
 
-    __u32 *counter = bpf_map_lookup_elem(&rr_counter, &zero);
+    void *pool = bpf_map_lookup_elem(&backend_pools, &l7);
+    if (!pool)
+        return XDP_PASS;
+
+    __u32 *counter = bpf_map_lookup_elem(&rr_counter, &l7);
     if (!counter)
         return XDP_PASS;
 
     __u32 slot = *counter % *count;
     *counter += 1;
 
-    struct backend *b = bpf_map_lookup_elem(&backends, &slot);
+    struct backend *b = bpf_map_lookup_elem(pool, &slot);
     if (!b)
         return XDP_PASS;
 
@@ -189,9 +201,9 @@ static __always_inline int balance(struct ethhdr *eth, struct iphdr *iph,
     case L7_HTTP:
     case L7_HTTPS:
     case L7_SSH:
-        return hash_balance(eth, iph, l4hdr, data_end, fk);
+        return hash_balance(eth, iph, l4hdr, data_end, fk, l7);
     default:
-        return round_robin(eth, iph, l4hdr, data_end);
+        return round_robin(eth, iph, l4hdr, data_end, l7);
     }
 }
 

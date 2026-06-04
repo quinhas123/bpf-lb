@@ -49,23 +49,11 @@ func TestXDPLoadBalance(t *testing.T) {
 		t.Skip("BPF_PROG_TEST_RUN requires root / CAP_BPF; run with sudo")
 	}
 
-	if err := rlimit.RemoveMemlock(); err != nil {
-		t.Fatalf("remove memlock: %v", err)
-	}
-
-	var objs xdpObjects
-	if err := loadXdpObjects(&objs, nil); err != nil {
-		t.Fatalf("load eBPF objects: %v", err)
-	}
-	defer objs.Close()
-
 	servers := []server{
 		{IP: "127.0.0.2", MAC: "00:00:00:00:00:00"},
 		{IP: "127.0.0.3", MAC: "00:00:00:00:00:00"},
 	}
-	if err := populateBackends(&objs, servers); err != nil {
-		t.Fatalf("populate backends: %v", err)
-	}
+	objs := loadAndPopulate(t, "http", servers)
 
 	// --- Forward: client -> VIP over HTTP (TCP). TCP is connection-oriented, so
 	// the dispatcher routes it to consistent hashing; expect DNAT to the
@@ -99,6 +87,37 @@ func TestXDPLoadBalance(t *testing.T) {
 	}
 }
 
+// loadAndPopulate loads the XDP program and fills a single L7 pool with the
+// given servers, registering teardown via t.Cleanup.
+func loadAndPopulate(t *testing.T, poolName string, servers []server) *xdpObjects {
+	t.Helper()
+
+	if err := rlimit.RemoveMemlock(); err != nil {
+		t.Fatalf("remove memlock: %v", err)
+	}
+
+	spec, err := loadXdp()
+	if err != nil {
+		t.Fatalf("load spec: %v", err)
+	}
+
+	objs := &xdpObjects{}
+	if err := spec.LoadAndAssign(objs, nil); err != nil {
+		t.Fatalf("load eBPF objects: %v", err)
+	}
+	t.Cleanup(func() { objs.Close() })
+
+	cfg := &config{Pools: map[string]pool{poolName: {Servers: servers}}}
+	inners, err := populatePools(spec, objs, cfg)
+	for _, m := range inners {
+		t.Cleanup(func() { m.Close() })
+	}
+	if err != nil {
+		t.Fatalf("populate pools: %v", err)
+	}
+	return objs
+}
+
 // flowHashRef mirrors flow_hash() in xdp.c: FNV-1a over the flow_key bytes as
 // laid out on the little-endian / bpfel target. saddr contributes its four IP
 // octets in order; sport contributes its two network-order bytes (high, low);
@@ -130,23 +149,11 @@ func TestXDPHashBalanceHTTPS(t *testing.T) {
 		t.Skip("BPF_PROG_TEST_RUN requires root / CAP_BPF; run with sudo")
 	}
 
-	if err := rlimit.RemoveMemlock(); err != nil {
-		t.Fatalf("remove memlock: %v", err)
-	}
-
-	var objs xdpObjects
-	if err := loadXdpObjects(&objs, nil); err != nil {
-		t.Fatalf("load eBPF objects: %v", err)
-	}
-	defer objs.Close()
-
 	servers := []server{
 		{IP: "127.0.0.2", MAC: "00:00:00:00:00:00"},
 		{IP: "127.0.0.3", MAC: "00:00:00:00:00:00"},
 	}
-	if err := populateBackends(&objs, servers); err != nil {
-		t.Fatalf("populate backends: %v", err)
-	}
+	objs := loadAndPopulate(t, "https", servers)
 	backendBySlot := []net.IP{backend0, backend1}
 	count := uint32(len(servers))
 
