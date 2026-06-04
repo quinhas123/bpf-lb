@@ -11,19 +11,6 @@
 #include <bpf/bpf_endian.h>   // bpf_htons / bpf_ntohs (network <-> host byte order)
 
 #define MAX_BACKENDS 256
-#define MAX_CONNTRACK_ENTRIES 1024
-
-// The test topology runs entirely on the loopback interface, so every address
-// is in 127.0.0.0/8. IP(x) -> 127.0.0.x in network byte order (the constant is
-// laid out little-endian, matching this VM and the bpfel target).
-#define IP(x) (127 + (0 << 8) + (0 << 16) + (x << 24))
-#define BACKEND_A 2
-#define BACKEND_B 3
-
-// The single virtual IP clients connect to (the loopback address the LB is
-// attached to). Backend replies have their source restored to this so the
-// client sees one consistent address.
-#define VIP IP(1)
 
 struct backend {
     __be32 ip;
@@ -45,19 +32,6 @@ static __always_inline struct flow_key flow_key_of(__be32 saddr, __u16 sport, __
     fk.proto = proto;
     return fk;
 }
-
-struct ct_entry {
-    struct backend backend;                      // forward path
-    struct backend original_destination_server;  // reverse path
-};
-
-// TODO: delete the entry on FIN/RST instead of relying on LRU eviction.
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, struct flow_key);
-    __type(value, struct ct_entry);
-    __uint(max_entries, MAX_CONNTRACK_ENTRIES);
-} conntrack SEC(".maps");
 
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
@@ -154,38 +128,6 @@ static __always_inline int rewrite_to_backend(struct ethhdr *eth, struct iphdr *
     return XDP_TX;
 }
 
-static __always_inline int rewrite_to_client(struct ethhdr *eth, struct iphdr *iph,
-                                              void *l4hdr, void *data_end,
-                                              struct backend *original_destination_server) {
-    // rearrange MAC addresses
-    __builtin_memcpy(eth->h_source, eth->h_dest, ETH_ALEN);
-    __builtin_memcpy(eth->h_dest, original_destination_server->mac, ETH_ALEN);
-
-    // src IP is LB IP
-    __be32 old_saddr = iph->saddr;
-    iph->saddr = original_destination_server->ip;
-    iph->check = csum_replace32(iph->check, old_saddr, iph->saddr);
-
-    // L4: the src IP is part of the TCP/UDP pseudo-header, so patch those too.
-    if (iph->protocol == IPPROTO_TCP) {
-        struct tcphdr *th = l4hdr;
-        if ((void *)(th + 1) > data_end)
-            return XDP_PASS;
-        th->check = csum_replace32(th->check, old_saddr, iph->saddr);
-    } else if (iph->protocol == IPPROTO_UDP) {
-        struct udphdr *uh = l4hdr;
-        if ((void *)(uh + 1) > data_end)
-            return XDP_PASS;
-        // A zero UDP checksum means "no checksum" in IPv4; leave it alone.
-        if (uh->check) {
-            __u16 c = csum_replace32(uh->check, old_saddr, iph->saddr);
-            uh->check = c ? c : 0xffff;  // 0 is reserved, use the equivalent 0xffff
-        }
-    }
-
-    return XDP_TX;
-}
-
 // FNV-1a simple hashing for consistent hashing (no remapping supported)
 static __always_inline __u32 flow_hash(const struct flow_key *fk) {
     __u32 offset = 2166136261u;
@@ -215,18 +157,11 @@ static __always_inline int hash_balance(struct ethhdr *eth, struct iphdr *iph,
     if (!b)
         return XDP_PASS;
 
-    struct ct_entry e = { .backend = *b };
-    __builtin_memcpy(e.original_destination_server.mac, eth->h_source, ETH_ALEN);
-    e.original_destination_server.ip = iph->daddr;
-    // TODO: do not ignore return
-    bpf_map_update_elem(&conntrack, fk, &e, BPF_ANY);
-
     return rewrite_to_backend(eth, iph, l4hdr, data_end, b);
 }
 
 static __always_inline int round_robin(struct ethhdr *eth, struct iphdr *iph,
-                                        void *l4hdr, void *data_end,
-                                        struct flow_key *fk) {
+                                        void *l4hdr, void *data_end) {
     __u32 zero = 0;
 
     __u32 *count = bpf_map_lookup_elem(&backend_count, &zero);
@@ -243,12 +178,6 @@ static __always_inline int round_robin(struct ethhdr *eth, struct iphdr *iph,
     struct backend *b = bpf_map_lookup_elem(&backends, &slot);
     if (!b)
         return XDP_PASS;
-    
-    struct ct_entry e = { .backend = *b };
-    __builtin_memcpy(e.original_destination_server.mac, eth->h_source, ETH_ALEN);
-    e.original_destination_server.ip = iph->daddr;
-    // TODO: do not ignore return
-    bpf_map_update_elem(&conntrack, fk, &e, BPF_ANY);
 
     return rewrite_to_backend(eth, iph, l4hdr, data_end, b);
 }
@@ -257,10 +186,12 @@ static __always_inline int balance(struct ethhdr *eth, struct iphdr *iph,
                                     void *l4hdr, void *data_end,
                                     struct flow_key *fk, enum l7_proto l7) {
     switch (l7) {
+    case L7_HTTP:
     case L7_HTTPS:
+    case L7_SSH:
         return hash_balance(eth, iph, l4hdr, data_end, fk);
     default:
-        return round_robin(eth, iph, l4hdr, data_end, fk);
+        return round_robin(eth, iph, l4hdr, data_end);
     }
 }
 
@@ -327,27 +258,11 @@ int xdp_ingress(struct xdp_md *ctx) {
 
     enum l7_proto l7 = l7_from_ports(l4proto, sport, dport);
 
-    // TODO: move logic to TC_egress hook
-    if (iph != NULL && (iph->saddr == IP(BACKEND_A) || iph->saddr == IP(BACKEND_B))) {
-        struct flow_key client_fk = flow_key_of(iph->daddr, dport, l4proto);
-
-        struct ct_entry *e = bpf_map_lookup_elem(&conntrack, &client_fk);
-        if (e == NULL)
-            return XDP_PASS;
-
-        return rewrite_to_client(eth, iph, l4hdr, data_end, &e->original_destination_server);
-    }
-
     // only ipv4 tcp/udp is balanced
     if (l7 != L7_UNKNOWN) {
         struct flow_key client_fk = flow_key_of(iph->saddr, sport, l4proto);
-
-        struct ct_entry *e = bpf_map_lookup_elem(&conntrack, &client_fk);
-        if (e == NULL) {
-            return balance(eth, iph, l4hdr, data_end, &client_fk, l7);
-        }
-
-        return rewrite_to_backend(eth, iph, l4hdr, data_end, &e->backend);
+ 
+        return balance(eth, iph, l4hdr, data_end, &client_fk, l7);
     }
 
     return XDP_PASS;
