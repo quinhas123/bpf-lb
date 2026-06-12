@@ -3,7 +3,6 @@
 #include <linux/bpf.h>
 #include <linux/if_ether.h>   // struct ethhdr, ETH_P_IP, ETH_P_IPV6, ETH_ALEN
 #include <linux/ip.h>         // struct iphdr (IPv4)
-#include <linux/ipv6.h>       // struct ipv6hdr
 #include <linux/tcp.h>        // struct tcphdr
 #include <linux/udp.h>        // struct udphdr
 #include <linux/in.h>         // IPPROTO_TCP, IPPROTO_UDP
@@ -15,6 +14,7 @@
 struct backend {
     __be32 ip;
     __u8   mac[6];
+    __u16  weight;  // relative round-robin share; occupies the former padding
 };
 
 struct flow_key {
@@ -70,6 +70,13 @@ struct {
     __type(value, __u32);
     __uint(max_entries, L7_MAX);
 } backend_count SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __type(key, enum l7_proto);
+    __type(value, __u32);
+    __uint(max_entries, L7_MAX);
+} total_weight SEC(".maps");
 
 static __always_inline enum l7_proto l7_from_ports(__u8 l4, __u16 sport, __u16 dport) {
     // sort the two ports for symmetrical protocol identification in request and response
@@ -177,18 +184,28 @@ static __always_inline int round_robin(struct ethhdr *eth, struct iphdr *iph,
     if (!pool)
         return XDP_PASS;
 
+    __u32 *total = bpf_map_lookup_elem(&total_weight, &l7);
+    if (!total || *total == 0)
+        return XDP_PASS;
+
     __u32 *counter = bpf_map_lookup_elem(&rr_counter, &l7);
     if (!counter)
         return XDP_PASS;
 
-    __u32 slot = *counter % *count;
+    __u32 tick = *counter % *total;
     *counter += 1;
 
-    struct backend *b = bpf_map_lookup_elem(pool, &slot);
-    if (!b)
-        return XDP_PASS;
+    __u32 n = *count;
+    for (__u32 i = 0; i < MAX_BACKENDS && i < n; i++) {
+        struct backend *b = bpf_map_lookup_elem(pool, &i);
+        if (!b)
+            return XDP_PASS;
+        if (tick < b->weight)
+            return rewrite_to_backend(eth, iph, l4hdr, data_end, b);
+        tick -= b->weight;
+    }
 
-    return rewrite_to_backend(eth, iph, l4hdr, data_end, b);
+    return XDP_PASS;
 }
 
 static __always_inline int balance(struct ethhdr *eth, struct iphdr *iph,

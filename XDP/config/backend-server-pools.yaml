@@ -1,4 +1,7 @@
 # pool names must match enum l7_proto in xdp.c (http, https, dns, ssh)
+# each server takes an optional `weight` (default 1): its relative share of
+# round-robin picks
+
 pools:
   http:
     servers:

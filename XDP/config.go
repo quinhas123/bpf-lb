@@ -11,8 +11,9 @@ import (
 )
 
 type server struct {
-	IP  string `yaml:"ip"`
-	MAC string `yaml:"mac"`
+	IP     string `yaml:"ip"`
+	MAC    string `yaml:"mac"`
+	Weight uint16 `yaml:"weight"`
 }
 
 type pool struct {
@@ -23,13 +24,10 @@ type config struct {
 	Pools map[string]pool `yaml:"pools"`
 }
 
-// backendEntry mirrors `struct backend` in xdp.c: a 4-byte IPv4 address and a
-// 6-byte MAC, padded to 12 bytes. Defined here because the inner pool map
-// declares its value by size, so bpf2go emits no Go type for it.
 type backendEntry struct {
-	IP  uint32
-	MAC [6]byte
-	_   [2]byte
+	IP     uint32
+	MAC    [6]byte
+	Weight uint16
 }
 
 var l7Index = map[string]xdpL7Proto{
@@ -74,6 +72,7 @@ func populatePools(spec *ebpf.CollectionSpec, objs *xdpObjects, cfg *config) ([]
 		}
 		inners = append(inners, inner)
 
+		var total uint32
 		for i, s := range p.Servers {
 			b, err := backendValue(s, i)
 			if err != nil {
@@ -82,6 +81,7 @@ func populatePools(spec *ebpf.CollectionSpec, objs *xdpObjects, cfg *config) ([]
 			if err := inner.Put(uint32(i), &b); err != nil {
 				return inners, fmt.Errorf("pool %q: writing backend %d: %w", name, i, err)
 			}
+			total += uint32(b.Weight)
 		}
 
 		if err := objs.BackendPools.Put(l7, inner); err != nil {
@@ -90,6 +90,9 @@ func populatePools(spec *ebpf.CollectionSpec, objs *xdpObjects, cfg *config) ([]
 		count := uint32(len(p.Servers))
 		if err := objs.BackendCount.Put(l7, &count); err != nil {
 			return inners, fmt.Errorf("pool %q: writing backend count: %w", name, err)
+		}
+		if err := objs.TotalWeight.Put(l7, &total); err != nil {
+			return inners, fmt.Errorf("pool %q: writing total weight: %w", name, err)
 		}
 	}
 	return inners, nil
@@ -109,9 +112,15 @@ func backendValue(s server, idx int) (backendEntry, error) {
 		return backendEntry{}, fmt.Errorf("backend %d: MAC %q is not 6 bytes", idx, s.MAC)
 	}
 
+	weight := s.Weight
+	if weight == 0 {
+		weight = 1
+	}
+
 	// eBPF side stores the IP as __be32 (network byte order)
 	b := backendEntry{
-		IP: binary.LittleEndian.Uint32(ip.To4()),
+		IP:     binary.LittleEndian.Uint32(ip.To4()),
+		Weight: weight,
 	}
 	copy(b.MAC[:], mac)
 	return b, nil

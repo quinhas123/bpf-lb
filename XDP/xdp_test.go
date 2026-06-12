@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 
 	"github.com/cilium/ebpf/rlimit"
@@ -186,6 +187,77 @@ func TestXDPHashBalanceHTTPS(t *testing.T) {
 	if len(seen) < 2 {
 		t.Errorf("hash sent all flows to %v; expected a spread across both backends", seen)
 	}
+}
+
+// TestXDPWeightedRoundRobinDNS drives DNS-over-UDP packets through the
+// program, which the dispatcher routes to round_robin, and asserts the picks
+// honor the configured 2:1 weights.
+func TestXDPWeightedRoundRobinDNS(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("BPF_PROG_TEST_RUN requires root / CAP_BPF; run with sudo")
+	}
+
+	servers := []server{
+		{IP: "127.0.0.2", MAC: "00:00:00:00:00:00", Weight: 2},
+		{IP: "127.0.0.3", MAC: "00:00:00:00:00:00", Weight: 1},
+	}
+	objs := loadAndPopulate(t, "dns", servers)
+
+	const packets = 300
+	counts := map[string]int{}
+	for i := range packets {
+		pkt := buildUDPPacket(clientMAC, lbMAC, clientIP, vip, clientPort, 53)
+		verdict, out, err := objs.XdpIngress.Test(pkt)
+		if err != nil {
+			t.Fatalf("packet %d: run: %v", i, err)
+		}
+		if verdict != xdpTx {
+			t.Fatalf("packet %d: verdict = %d, want XDP_TX (%d)", i, verdict, xdpTx)
+		}
+		out = out[:len(pkt)]
+		counts[net.IP(out[ethLen+16:ethLen+20]).String()]++
+	}
+
+	// rr_counter is per-CPU and BPF_PROG_TEST_RUN executes on whichever CPU
+	// the test goroutine lands on, so each CPU walks its own cycle; a partial
+	// cycle skews the split by at most 1 packet per CPU.
+	want := packets * 2 / 3
+	tol := runtime.NumCPU() + 1
+	got := counts[backend0.String()]
+	if got < want-tol || got > want+tol {
+		t.Errorf("weight-2 backend got %d of %d packets, want %d±%d (full split: %v)",
+			got, packets, want, tol, counts)
+	}
+}
+
+// buildUDPPacket assembles an Ethernet+IPv4+UDP frame with a valid IP checksum
+// and a zero (disabled) UDP checksum.
+func buildUDPPacket(srcMAC, dstMAC net.HardwareAddr, srcIP, dstIP net.IP, sport, dport uint16) []byte {
+	const udpLen = 8
+	pkt := make([]byte, ethLen+ipLen+udpLen)
+
+	// Ethernet
+	copy(pkt[0:6], dstMAC)
+	copy(pkt[6:12], srcMAC)
+	binary.BigEndian.PutUint16(pkt[12:14], 0x0800) // ETH_P_IP
+
+	// IPv4
+	ip := pkt[ethLen : ethLen+ipLen]
+	ip[0] = 0x45 // version 4, IHL 5 (20 bytes)
+	binary.BigEndian.PutUint16(ip[2:4], uint16(ipLen+udpLen))
+	ip[8] = 64 // TTL
+	ip[9] = 17 // IPPROTO_UDP
+	copy(ip[12:16], srcIP.To4())
+	copy(ip[16:20], dstIP.To4())
+	binary.BigEndian.PutUint16(ip[10:12], ipChecksum(ip))
+
+	// UDP, checksum 0 = disabled for IPv4
+	udp := pkt[ethLen+ipLen:]
+	binary.BigEndian.PutUint16(udp[0:2], sport)
+	binary.BigEndian.PutUint16(udp[2:4], dport)
+	binary.BigEndian.PutUint16(udp[4:6], udpLen)
+
+	return pkt
 }
 
 // buildTCPPacket assembles an Ethernet+IPv4+TCP frame with valid IP and TCP
